@@ -1,0 +1,106 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.0.1
+    container_name: zookeeper
+    # Без ZooKeeper брокеры не стартуют, поэтому после перезапуска Docker он должен подниматься сам
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - kafka-network
+    ports:
+      - "2181:2181"
+  kafka:
+    image: confluentinc/cp-kafka:7.0.1
+    container_name: kafka
+    restart: on-failure
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Два listener-а: PLAINTEXT (kafka:29092) для контейнеров в kafka-network,
+      # PLAINTEXT_HOST (localhost:9092) для приложений, запущенных на хосте
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - kafka-network
+    ports:
+      - "9092:9092"
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.0.1
+    restart: on-failure
+    depends_on:
+      - kafka
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:29092
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    networks:
+      - kafka-network
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.0
+    ports:
+      - "8080:8080"
+    environment:
+      - KAFKA_CLUSTERS_0_BOOTSTRAP_SERVERS=kafka:29092
+      - KAFKA_CLUSTERS_0_NAME=kafka-cluster
+      - KAFKA_CLUSTERS_0_ZOOKEEPER=zookeeper:2181
+      - KAFKA_CLUSTERS_0_SCHEMAREGISTRY=http://schema-registry:8081
+      - KAFKA_CLUSTERS_0_KSQLDBSERVER=http://ksqldb-server:8088
+    depends_on:
+      - kafka
+    networks:
+      - kafka-network
+  ksqldb-server:
+    image: confluentinc/ksqldb-server:latest
+    depends_on:
+      - kafka
+    environment:
+      KSQL_BOOTSTRAP_SERVERS: kafka:29092
+    ports:
+      - "8088:8088"
+    networks:
+      - kafka-network
+  ksqldb-cli:
+    image: confluentinc/ksqldb-cli:latest
+    depends_on:
+      - ksqldb-server
+    entrypoint: /bin/sh -c 'exec ksql http://ksqldb-server:8088'
+    stdin_open: true
+    tty: true
+    networks:
+      - kafka-network
+  # Приложение. Перед запуском соберите jar: ./gradlew bootJar
+  app:
+    build: .
+    # Если брокер ещё не готов, приложение не сможет создать топики и завершится с ошибкой – тогда перезапускаем
+    restart: on-failure
+    depends_on:
+      - kafka
+    environment:
+      # Внутри сети Docker брокер доступен по внутреннему listener-у PLAINTEXT
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      # Файлы persistent state store лежат в volume и переживают пересоздание контейнера
+      KAFKA_STATE_DIR: /app/state
+      # Тестовые данные при старте. Отключить: APP_TEST_DATA_ENABLED=false docker compose up -d
+      APP_TEST_DATA_ENABLED: ${APP_TEST_DATA_ENABLED:-true}
+    volumes:
+      - app-state:/app/state
+    # Время на штатную остановку: Kafka Streams закрывается до 10 секунд
+    stop_grace_period: 15s
+    networks:
+      - kafka-network
+
+volumes:
+  app-state:
+
+networks:
+  kafka-network:
+    driver: bridge
